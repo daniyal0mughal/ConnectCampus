@@ -1,0 +1,72 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function profile() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function superAdmin() { return signedIn() && profile().role == 'super_admin'; }
+    function text(value,max) { return value is string && value.size() > 0 && value.size() <= max && value.matches('(?s).*[^\\s].*'); }
+    function validStatus(status) { return status in ['Pending','In Progress','Resolved','Rejected']; }
+    function departmentAdmin(data) { return signedIn() && profile().role == 'dept_admin' && profile().department_id == data.department_id; }
+    function canReadComplaint(data) {
+      return signedIn() && (superAdmin() || (profile().role == 'student' && data.student_id == request.auth.uid) || departmentAdmin(data));
+    }
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || superAdmin());
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['full_name','email','role','department_id','created_at'])
+        && text(request.resource.data.full_name,100) && text(request.resource.data.email,150)
+        && request.resource.data.created_at == request.time
+        && ((request.auth.uid == uid && request.resource.data.email == request.auth.token.email
+             && request.resource.data.role == 'student' && request.resource.data.department_id == null)
+          || (superAdmin() && uid != request.auth.uid && request.resource.data.role == 'dept_admin'
+             && request.resource.data.department_id in ['cs','medical']
+             && exists(/databases/$(database)/documents/departments/$(request.resource.data.department_id))));
+      allow update, delete: if false;
+    }
+    match /departments/{id} { allow read: if signedIn(); allow write: if false; }
+    match /categories/{id} { allow read: if signedIn(); allow write: if false; }
+    match /complaints/{id} {
+      allow read: if (signedIn() && resource == null && id.matches(request.auth.uid + '_[a-zA-Z0-9]{20}')) || canReadComplaint(resource.data);
+      allow create: if signedIn() && profile().role == 'student'
+        && request.resource.data.keys().hasOnly(['student_id','student_name','category_id','department_id','title','description','status','rejection_reason','latest_remark','last_remark_id','created_at','updated_at'])
+        && request.resource.data.student_id == request.auth.uid && request.resource.data.student_name == profile().full_name
+        && text(request.resource.data.title,200) && text(request.resource.data.description,10000)
+        && request.resource.data.department_id in ['cs','medical']
+        && request.resource.data.department_id == get(/databases/$(database)/documents/categories/$(request.resource.data.category_id)).data.department_id
+        && exists(/databases/$(database)/documents/departments/$(request.resource.data.department_id))
+        && request.resource.data.status == 'Pending'
+        && request.resource.data.rejection_reason == null && request.resource.data.latest_remark == null && request.resource.data.last_remark_id == null
+        && request.resource.data.created_at == request.time && request.resource.data.updated_at == request.time;
+      function atomicReply() {
+        let replyId=request.resource.data.last_remark_id;
+        let reply=getAfter(/databases/$(database)/documents/complaint_remarks/$(replyId)).data;
+        return replyId is string && !exists(/databases/$(database)/documents/complaint_remarks/$(replyId))
+          && reply.complaint_id==id && reply.admin_id==request.auth.uid
+          && reply.status_set==request.resource.data.status && reply.remark==request.resource.data.latest_remark && reply.created_at==request.time;
+      }
+      allow update: if departmentAdmin(resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','rejection_reason','latest_remark','last_remark_id','updated_at'])
+        && validStatus(request.resource.data.status) && text(request.resource.data.latest_remark,4000)
+        && (request.resource.data.status=='Rejected' ? text(request.resource.data.rejection_reason,4000) : request.resource.data.rejection_reason==null)
+        && request.resource.data.updated_at==request.time && atomicReply();
+      allow delete: if false;
+    }
+    match /complaint_remarks/{id} {
+      allow get: if signedIn() && profile().role == 'dept_admin' && resource == null && id.matches(request.auth.uid + '_[a-zA-Z0-9]{20}');
+      allow read: if canReadComplaint(get(/databases/$(database)/documents/complaints/$(resource.data.complaint_id)).data);
+      function validReply() {
+        let data=request.resource.data;
+        let complaint=getAfter(/databases/$(database)/documents/complaints/$(data.complaint_id)).data;
+        return departmentAdmin(complaint) && data.admin_id==request.auth.uid && data.admin_name==profile().full_name
+          && data.keys().hasOnly(['complaint_id','admin_id','admin_name','remark','status_set','created_at'])
+          && text(data.remark,4000) && validStatus(data.status_set)
+          && complaint.last_remark_id==id && complaint.latest_remark==data.remark && complaint.status==data.status_set
+          && complaint.updated_at==request.time && data.created_at==request.time;
+      }
+      allow create: if signedIn() && validReply();
+      allow update,delete: if false;
+    }
+    match /attachments/{id} { allow read: if canReadComplaint(get(/databases/$(database)/documents/complaints/$(resource.data.complaint_id)).data); allow write: if false; }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
